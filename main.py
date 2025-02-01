@@ -3,14 +3,20 @@ from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
 from PIL import Image
 import io
-import yolov8  # Assuming you have YOLOv8 installed
+from ultralytics import YOLO  # Updated YOLOv8 import
 from pydantic import BaseModel
 import uvicorn
 import os
+import logging
+from typing import Dict, List, Optional
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Configure CORS
+# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,30 +24,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure Gemini
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+# Configuration
+YOLO_CLASSES = {"desi_food", "fast_food", "fruit"}  # Your trained classes
+MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10MB
+ALLOWED_MIME_TYPES = {"image/jpeg", "image/png"}
 
-# Load YOLOv8 model
-yolo_model = yolov8.YOLO("best.pt")  # Your custom trained model
+# Initialize Models
+try:
+    # Configure Gemini
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    # Load YOLOv8 model
+    yolo_model = YOLO("best.pt")  # Your custom trained model
+    logger.info("Models loaded successfully")
+except Exception as e:
+    logger.error(f"Model initialization failed: {str(e)}")
+    raise RuntimeError("Failed to initialize models")
 
-# Food category database
-FOOD_DB = {
+# Enhanced Databases
+FOOD_DB: Dict[str, Dict] = {
     "biryani": {
         "category": "Desi Food",
         "nutrition": {"calories": 350, "protein": 15, "carbs": 45},
         "recipe": ["Basmati rice", "Chicken/Beef", "Yogurt", "Spices"]
     },
-    "pizza": {
-        "category": "Fast Food",
-        "nutrition": {"calories": 285, "protein": 12, "carbs": 36},
-        "recipe": ["Dough", "Cheese", "Tomato sauce", "Toppings"]
-    },
-    # Add more food items
+    # Add more items
 }
 
-# Nutrition database for fruits
-FRUIT_DB = {
+FRUIT_DB: Dict[str, Dict] = {
     "apple": {
         "category": "Fruit",
         "nutrition": {"calories": 95, "vitamin_c": "14%", "fiber": "17%"}
@@ -53,118 +64,131 @@ class AnalysisResponse(BaseModel):
     model_used: str
     object_name: str
     category: str
-    details: dict
-    description: str = None
-    recipe: list = None
-    nutrition: dict = None
+    confidence: Optional[float] = None
+    description: str
+    details: Dict
+    nutrition: Optional[Dict] = None
+    recipe: Optional[List[str]] = None
 
-def is_food_item(label: str) -> bool:
-    food_categories = ["desi", "fast", "food", "fruit"]
-    return any(cat in label.lower() for cat in food_categories)
+def validate_image(file: UploadFile):
+    if file.content_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(400, "Unsupported file type")
+    if file.size > MAX_IMAGE_SIZE:
+        raise HTTPException(400, "File too large")
 
-async def gemini_analysis(image_bytes: bytes) -> AnalysisResponse:
+async def get_image_bytes(file: UploadFile) -> bytes:
+    return await file.read()
+
+def is_yolo_target(label: str) -> bool:
+    """Check if detection matches trained classes"""
+    return label.lower() in YOLO_CLASSES
+
+async def process_yolo_detection(image_bytes: bytes) -> Optional[AnalysisResponse]:
+    """Enhanced YOLO processing with error handling"""
     try:
-        img = Image.open(io.BytesIO(image_bytes))
-        
-        prompt = """Analyze this image and provide:
-        - Object name (exclude desi food, fast food, and fruits)
-        - Category
-        - Detailed technical description
-        - Material composition
-        - Typical usage scenarios"""
-
-        response = gemini_model.generate_content([prompt, img])
-        
-        # Parse Gemini response
-        # You'll need to implement proper response parsing based on your format
-        parsed_response = parse_gemini_output(response.text)
-        
-        return AnalysisResponse(
-            model_used="Gemini 1.5 Flash",
-            **parsed_response
-        )
-        
-    except Exception as e:
-        raise HTTPException(500, f"Gemini analysis failed: {str(e)}")
-
-async def yolo_analysis(image_bytes: bytes) -> AnalysisResponse:
-    try:
-        # Perform YOLO detection
         results = yolo_model.predict(image_bytes)
-        
-        # Get top detection
+        if not results:
+            return None
+
         detection = results[0]
+        if len(detection.boxes.cls) == 0:
+            return None
+
         label = detection.names[int(detection.boxes.cls[0])]
         confidence = detection.boxes.conf[0].item()
-        
+
+        if not is_yolo_target(label):
+            return None
+
         # Get additional details
         if label.lower() in FRUIT_DB:
             details = FRUIT_DB[label.lower()]
-            details["confidence"] = confidence
             return AnalysisResponse(
                 model_used="YOLOv8 Custom",
                 object_name=label,
                 category=details["category"],
-                nutrition=details["nutrition"],
-                description=f"Nutritional information for {label}"
+                confidence=confidence,
+                description=f"Nutritional information for {label}",
+                details=details,
+                nutrition=details.get("nutrition", {})
             )
         else:
             details = FOOD_DB.get(label.lower(), {})
-            details["confidence"] = confidence
             return AnalysisResponse(
                 model_used="YOLOv8 Custom",
                 object_name=label,
                 category=details.get("category", "Food"),
+                confidence=confidence,
+                description=f"Details for {label}",
+                details=details,
                 recipe=details.get("recipe", []),
-                nutrition=details.get("nutrition", {}),
-                description=f"Details for {label}"
+                nutrition=details.get("nutrition", {})
             )
             
     except Exception as e:
-        raise HTTPException(500, f"YOLO analysis failed: {str(e)}")
+        logger.error(f"YOLO processing error: {str(e)}")
+        return None
+
+async def process_gemini_analysis(image_bytes: bytes) -> AnalysisResponse:
+    """Enhanced Gemini analysis with structured output"""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        
+        structured_prompt = """Analyze this image and provide STRICT JSON format response with these fields:
+        - object_name: (non-food item name)
+        - category: (technical category)
+        - technical_description: (detailed technical specs)
+        - materials: (list of materials)
+        - typical_usage: (common usage scenarios)"""
+
+        response = gemini_model.generate_content([structured_prompt, img])
+        
+        try:
+            parsed = parse_gemini_json(response.text)
+            return AnalysisResponse(
+                model_used="Gemini 1.5 Flash",
+                object_name=parsed.get("object_name", "Unknown Object"),
+                category=parsed.get("category", "General"),
+                description=parsed.get("technical_description", ""),
+                details={
+                    "materials": parsed.get("materials", []),
+                    "usage": parsed.get("typical_usage", [])
+                }
+            )
+        except Exception as e:
+            logger.error(f"Gemini parse error: {str(e)}")
+            raise HTTPException(500, "Failed to parse AI response")
+
+    except Exception as e:
+        logger.error(f"Gemini analysis failed: {str(e)}")
+        raise HTTPException(500, "General analysis failed")
+
+def parse_gemini_json(text: str) -> Dict:
+    """Extract JSON from Gemini response"""
+    start = text.find('{')
+    end = text.rfind('}') + 1
+    json_str = text[start:end]
+    return json.loads(json_str)
 
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze_image(file: UploadFile = File(...)):
-    if not file.content_type.startswith('image/'):
-        raise HTTPException(400, "Invalid file type")
-    
-    image_bytes = await file.read()
+    validate_image(file)
+    image_bytes = await get_image_bytes(file)
     
     try:
-        # First check if it's food using YOLO quick check
-        is_food = await check_food_quick(image_bytes)
-        
-        if is_food:
-            return await yolo_analysis(image_bytes)
-        else:
-            return await gemini_analysis(image_bytes)
+        # First try YOLO detection
+        yolo_response = await process_yolo_detection(image_bytes)
+        if yolo_response:
+            return yolo_response
             
+        # Fallback to Gemini
+        return await process_gemini_analysis(image_bytes)
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(500, f"Analysis failed: {str(e)}")
-
-async def check_food_quick(image_bytes: bytes) -> bool:
-    """Quick check using YOLO to determine if food item"""
-    try:
-        results = yolo_model.predict(image_bytes)
-        detection = results[0]
-        label = detection.names[int(detection.boxes.cls[0])]
-        return is_food_item(label)
-    except:
-        return False
-
-def parse_gemini_output(text: str) -> dict:
-    """Implement your custom parsing logic here"""
-    # Example implementation:
-    lines = text.split("\n")
-    return {
-        "object_name": lines[0].split(": ")[1],
-        "category": lines[1].split(": ")[1],
-        "description": lines[2].split(": ")[1],
-        "details": {
-            "material": lines[3].split(": ")[1],
-            "usage": lines[4].split(": ")[1]
-        }
-    }
+        logger.error(f"Analysis failed: {str(e)}")
+        raise HTTPException(500, "Analysis process failed")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
